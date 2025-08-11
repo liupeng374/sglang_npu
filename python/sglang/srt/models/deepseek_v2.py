@@ -28,6 +28,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from python.sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
@@ -1092,9 +1093,31 @@ class DeepseekV2AttentionMLA(nn.Module):
                 positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
-            inner_state = self.forward_absorb_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+            is_extend = (
+                forward_batch.forward_mode == ForwardMode.EXTEND
+                or forward_batch.forward_mode == ForwardMode.MIXED
             )
+            if is_extend or not _use_mlapo:
+                inner_state = self.forward_absorb_prepare(
+                    positions, hidden_states, forward_batch, zero_allocator
+                )
+            else:
+                if self.mla_preprocess is None:
+                    self.mla_preprocess = NPU_FusedMLAPreprocess(
+                        self.fused_qkv_a_proj_with_mqa,
+                        self.q_a_layernorm,
+                        self.kv_a_layernorm,
+                        self.q_b_proj,
+                        self.w_kc,
+                        self.rotary_emb,
+                        self.layer_id,
+                        self.num_local_heads,
+                        self.qk_nope_head_dim,
+                        self.qk_rope_head_dim,
+                    )
+                inner_state = self.mla_preprocess.forward(
+                    positions, hidden_states, forward_batch, zero_allocator
+                )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
@@ -1273,9 +1296,20 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
             )
         else:
-            q = torch.cat([q_nope_out, q_pe], dim=-1)
-            k = torch.cat([k_nope, k_pe], dim=-1)
-            attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
+            is_extend = (
+                forward_batch.forward_mode == ForwardMode.EXTEND
+                or forward_batch.forward_mode == ForwardMode.MIXED
+            )
+            if is_extend:
+                q = torch.cat([q_nope_out, q_pe], dim=-1)
+                attn_output = self.attn_mqa(
+                    q, k_nope, k_pe, forward_batch, save_kv_cache=True
+                )
+            else:
+                q = (q_nope_out, q_pe)
+                attn_output = self.attn_mqa(
+                    q, k_nope, k_pe, forward_batch, save_kv_cache=not _use_mlapo
+                )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
@@ -2149,7 +2183,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # Perform post-processing after loading weights
         if is_nextn:
-            layer_ids = [self.config.num_hidden_layers]
+            layer_ids = [61]
         else:
             if weight_names is None:
                 layer_ids = range(self.config.num_hidden_layers)
@@ -2383,11 +2417,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 num_nextn_layers = self.config.num_nextn_predict_layers
                 assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
                 # compatible with old design
-                nextn_layer_id = (
-                    0
-                    if self.config.num_hidden_layers == 1
-                    else self.config.num_hidden_layers
-                )
+                nextn_layer_id = 61
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
@@ -2611,8 +2641,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        # torch.cuda.empty_cache()
+        # torch.cuda.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
